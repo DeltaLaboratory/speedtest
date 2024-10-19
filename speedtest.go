@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"strings"
 	"time"
@@ -11,18 +12,33 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// Configuration parameters
 var (
-	numConcurrent          = 8
-	initialSize      int64 = 5 * 1024 * 1024   // 5MiB
-	maxSize          int64 = 125 * 1024 * 1024 // 125MiB
-	updateInterval         = 75 * time.Millisecond
-	operationTimeout       = 30 * time.Second
+	// Number of concurrent connections, default is 8
+	numConcurrent int
+	// Initial segment size in bytes, default is 5MB
+	initialSize int64
+	// Maximum segment size in bytes, default is 128MB
+	maxSize int64
+	// UI update interval, default is 75ms
+	updateInterval time.Duration
+	// Operation timeout, default is 30s
+	operationTimeout time.Duration
 )
+
+// Initialize configuration parameters
+func init() {
+	flag.IntVar(&numConcurrent, "concurrent", 8, "Number of concurrent connections")
+	flag.Int64Var(&initialSize, "initial", 5*1024*1024, "Initial segment size in bytes")
+	flag.Int64Var(&maxSize, "max", 128*1024*1024, "Maximum segment size in bytes")
+	flag.DurationVar(&updateInterval, "update", 75*time.Millisecond, "UI update interval")
+	flag.DurationVar(&operationTimeout, "timeout", 30*time.Second, "Operation timeout")
+}
 
 // TransferMetric represents metrics for both download and upload operations
 type TransferMetric struct {
 	Progress float64
-	Speed    float64
+	Speed    int64
 	Done     bool
 	Err      error
 }
@@ -42,6 +58,7 @@ type BandwidthOperation interface {
 	Reset()
 }
 
+// Provider interface for speed test providers
 type Provider interface {
 	Name() string
 
@@ -53,23 +70,29 @@ type Provider interface {
 
 type tickMsg time.Time
 
+// SizeTestResult stores the result of a single segment size test
 type SizeTestResult struct {
 	SegmentSize  int64
-	TotalSpeed   float64
-	AverageSpeed float64
+	TotalSpeed   int64
+	AverageSpeed int64
 }
 
+// model represents the application state
 type model struct {
-	bandwidth    BandwidthOperation
-	quitting     bool
-	progresses   []progress.Model
-	segmentSize  int64
-	averageSpeed float64
+	bandwidth   BandwidthOperation
+	quitting    bool
+	progresses  []progress.Model
+	segmentSize int64
+
 	testComplete bool
-	totalSpeed   float64
-	results      []SizeTestResult
+
+	totalSpeedMetric  *SlidingWindowCounter
+	singleSpeedMetric *SlidingWindowCounter
+
+	results []SizeTestResult
 }
 
+// initialModel creates and initializes a new model
 func initialModel(bandwidth BandwidthOperation) model {
 	bandwidth.SetSegmentSize(initialSize)
 	bandwidth.Start()
@@ -78,20 +101,24 @@ func initialModel(bandwidth BandwidthOperation) model {
 		progresses[i] = progress.New(progress.WithDefaultGradient())
 	}
 	return model{
-		bandwidth:    bandwidth,
-		progresses:   progresses,
-		segmentSize:  initialSize,
-		averageSpeed: 0,
-		totalSpeed:   0,
+		bandwidth:   bandwidth,
+		progresses:  progresses,
+		segmentSize: initialSize,
+
+		totalSpeedMetric:  NewSlidingWindowCounter(10*time.Second, 1*time.Second),
+		singleSpeedMetric: NewSlidingWindowCounter(10*time.Second, 1*time.Second),
+
 		testComplete: false,
 		results:      []SizeTestResult{},
 	}
 }
 
+// Init initializes the model
 func (m model) Init() tea.Cmd {
 	return tick()
 }
 
+// Update handles updates to the model
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -106,11 +133,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Save result for current segment size
 				m.results = append(m.results, SizeTestResult{
 					SegmentSize:  m.segmentSize,
-					TotalSpeed:   m.totalSpeed,
-					AverageSpeed: m.averageSpeed,
+					TotalSpeed:   int64(m.totalSpeedMetric.Value() / 10),
+					AverageSpeed: int64(m.singleSpeedMetric.Value() / 10),
 				})
-				nextSize := calculateNextSize(m.segmentSize, m.totalSpeed)
+				nextSize := calculateNextSize(m.segmentSize, m.totalSpeedMetric.Value())
 				if nextSize > m.segmentSize && nextSize <= maxSize {
+					m.totalSpeedMetric.Reset()
+					m.singleSpeedMetric.Reset()
+
 					m.segmentSize = nextSize
 					m.bandwidth.SetSegmentSize(m.segmentSize)
 					m.bandwidth.Reset()
@@ -127,12 +157,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		metrics := m.bandwidth.GetMetrics()
-		var totalSpeed float64
+		var totalSpeed int64
 		for _, metric := range metrics {
 			totalSpeed += metric.Speed
 		}
-		m.totalSpeed = totalSpeed
-		m.averageSpeed = totalSpeed / float64(len(metrics))
+
+		m.totalSpeedMetric.Add(totalSpeed)
+		m.singleSpeedMetric.Add(totalSpeed / int64(len(metrics)))
 
 		for i, metric := range metrics {
 			m.progresses[i].SetPercent(metric.Progress)
@@ -143,6 +174,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// View renders the current state of the model
 func (m model) View() string {
 	if m.quitting {
 		return m.finalView()
@@ -165,12 +197,13 @@ func (m model) View() string {
 		}
 	}
 
-	s += fmt.Sprintf("\nTotal Connection Speed: %s\n", formatSpeed(m.totalSpeed))
-	s += fmt.Sprintf("Single Connection Speed: %s\n", formatSpeed(m.averageSpeed))
+	s += fmt.Sprintf("\nTotal Connection Speed: %s\n", formatSpeed(int64(m.totalSpeedMetric.Value()/10)))
+	s += fmt.Sprintf("Single Connection Speed: %s\n", formatSpeed(int64(m.singleSpeedMetric.Value()/10)))
 	s += "\nPress Ctrl+C to quit\n"
 	return s
 }
 
+// finalView renders the final results view
 func (m model) finalView() string {
 	operationType := m.bandwidth.OperationType()
 	s := fmt.Sprintf("%s Test Results:\n\n", operationType)
@@ -209,7 +242,7 @@ type providerSelectionModel struct {
 func initialProviderSelectionModel() providerSelectionModel {
 	items := []list.Item{
 		providerItem{name: "Cloudflare", description: "Cloudflare Speed test (https://speed.cloudflare.com)"},
-		providerItem{name: "Benchbee", description: "Benchbee Speed test (http://speed.benchbee.co.kr)"},
+		providerItem{name: "Benchbee", description: "Benchbee Speed test (https://speed.benchbee.co.kr)"},
 	}
 
 	l := list.New(items, list.NewDefaultDelegate(), 0, 0)
@@ -244,6 +277,9 @@ func (m providerSelectionModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.choice = Cloudflare{}
 				case "Benchbee":
 					m.choice = Benchbee{}
+				default:
+					fmt.Printf("Error: Unknown provider %s\n", i.name)
+					return m, tea.Quit
 				}
 			}
 			return m, tea.Quit
@@ -260,10 +296,12 @@ func (m providerSelectionModel) View() string {
 }
 
 func main() {
+	flag.Parse()
+
 	providerSelectionP := tea.NewProgram(initialProviderSelectionModel())
 	providerModel, err := providerSelectionP.Run()
 	if err != nil {
-		fmt.Printf("Error: %v", err)
+		fmt.Printf("Error running provider selection: %v\n", err)
 		return
 	}
 
@@ -277,14 +315,14 @@ func main() {
 	fmt.Println("Running Download Benchmark...")
 	p := tea.NewProgram(initialModel(NewDownloader(selectedProvider)))
 	if _, err := p.Run(); err != nil {
-		fmt.Printf("Error: %v", err)
+		fmt.Printf("Error running download benchmark: %v\n", err)
 	}
 
 	// Run upload benchmark
 	fmt.Println("\nRunning Upload Benchmark...")
 	p = tea.NewProgram(initialModel(NewUploader(selectedProvider)))
 	if _, err := p.Run(); err != nil {
-		fmt.Printf("Error: %v", err)
+		fmt.Printf("Error running upload benchmark: %v\n", err)
 	}
 
 	// Wait for user input before exiting

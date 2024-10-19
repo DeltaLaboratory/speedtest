@@ -6,8 +6,6 @@ import (
 	"net/http"
 	"sync"
 	"time"
-
-	"github.com/VividCortex/ewma"
 )
 
 type Downloader struct {
@@ -16,18 +14,12 @@ type Downloader struct {
 	metrics     []TransferMetric
 	done        bool
 	mu          sync.RWMutex
-	ewmas       []ewma.MovingAverage
 }
 
 func NewDownloader(provider Provider) *Downloader {
-	ewmas := make([]ewma.MovingAverage, numConcurrent)
-	for i := range ewmas {
-		ewmas[i] = ewma.NewMovingAverage(5)
-	}
 	return &Downloader{
 		provider: provider,
 		metrics:  make([]TransferMetric, numConcurrent),
-		ewmas:    ewmas,
 	}
 }
 
@@ -62,12 +54,22 @@ func (d *Downloader) downloadWorker(id int) {
 	defer cancel()
 
 	downloadLimit := d.provider.DownloadLimit()
-	downloaded := int64(0)
+	var downloaded int64
 
-	for d.currentSize > downloaded {
-		downloadSize := min(downloadLimit, d.currentSize-downloaded)
+	// Initialize a SlidingWindowCounter for tracking speed
+	metric := NewSlidingWindowCounter(10*time.Second, 1*time.Second)
 
-		metric := NewSpeedMeter(1 * time.Second)
+	for {
+		d.mu.RLock()
+		remaining := d.currentSize - downloaded
+		d.mu.RUnlock()
+
+		if remaining <= 0 {
+			d.updateMetric(id, TransferMetric{Progress: 1, Speed: int64(metric.Value()), Done: true})
+			return
+		}
+
+		downloadSize := min(downloadLimit, remaining)
 
 		req, err := http.NewRequestWithContext(ctx, "GET", d.provider.DownloadURL(downloadSize), nil)
 		if err != nil {
@@ -80,36 +82,45 @@ func (d *Downloader) downloadWorker(id int) {
 			d.updateMetric(id, TransferMetric{Err: err, Done: true})
 			return
 		}
-		defer resp.Body.Close()
 
-		var current int64
+		// Ensure the response body is closed
+		func() {
+			defer resp.Body.Close()
 
-		for {
-			select {
-			case <-ctx.Done():
-				d.updateMetric(id, TransferMetric{Err: ctx.Err(), Done: true})
-				return
-			default:
-				n, err := io.CopyN(io.Discard, resp.Body, 256*1024) // Read 256KiB at a time
-				current += n
-				metric.Add(n)
-				progress := float64(current) / float64(d.currentSize)
-				d.ewmas[id].Add(metric.Value())
-
-				d.updateMetric(id, TransferMetric{
-					Progress: progress,
-					Speed:    d.ewmas[id].Value() * 8 / 1024 / 1024,
-					Done:     progress >= 1,
-				})
-
-				if err != nil || progress >= 1 {
-					if err != io.EOF {
-						d.updateMetric(id, TransferMetric{Err: err, Done: true})
-					}
+			buffer := make([]byte, 16*1024) // 16 KiB buffer
+			for {
+				select {
+				case <-ctx.Done():
+					d.updateMetric(id, TransferMetric{Err: ctx.Err(), Done: true})
 					return
+				default:
+					n, err := resp.Body.Read(buffer)
+					if n > 0 {
+						downloaded += int64(n)
+						metric.Add(int64(n))
+						progress := float64(downloaded) / float64(d.currentSize)
+
+						d.updateMetric(id, TransferMetric{
+							Progress: progress,
+							Speed:    int64(metric.Value()),
+							Done:     progress >= 1,
+						})
+					}
+
+					if err != nil {
+						if err != io.EOF {
+							d.updateMetric(id, TransferMetric{Err: err, Done: true})
+						}
+						return
+					}
+
+					if downloaded >= d.currentSize {
+						d.updateMetric(id, TransferMetric{Progress: 1, Speed: int64(metric.Value()), Done: true})
+						return
+					}
 				}
 			}
-		}
+		}()
 	}
 }
 
@@ -122,9 +133,9 @@ func (d *Downloader) updateMetric(id int, metric TransferMetric) {
 func (d *Downloader) GetMetrics() []TransferMetric {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	metrics := make([]TransferMetric, len(d.metrics))
-	copy(metrics, d.metrics)
-	return metrics
+	metricsCopy := make([]TransferMetric, len(d.metrics))
+	copy(metricsCopy, d.metrics)
+	return metricsCopy
 }
 
 func (d *Downloader) IsDone() bool {
@@ -134,10 +145,14 @@ func (d *Downloader) IsDone() bool {
 }
 
 func (d *Downloader) SetSegmentSize(size int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	d.currentSize = size
 }
 
 func (d *Downloader) GetSegmentSize() int64 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	return d.currentSize
 }
 
@@ -145,8 +160,5 @@ func (d *Downloader) Reset() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.metrics = make([]TransferMetric, numConcurrent)
-	for i := range d.ewmas {
-		d.ewmas[i] = ewma.NewMovingAverage()
-	}
 	d.done = false
 }
